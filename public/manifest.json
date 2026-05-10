@@ -1,0 +1,17 @@
+{
+  "name": "Image Extractor Pro",
+  "short_name": "ImageExtractor",
+  "description": "自動化檔案圖片擷取工具",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#0a0a0a",
+  "icons": [
+    {
+      "src": "https://cdn-icons-png.flaticon.com/512/3342/3342137.png",
+      "sizes": "512x512",
+      "type": "image/png",
+      "purpose": "any maskable"
+    }
+  ]
+}

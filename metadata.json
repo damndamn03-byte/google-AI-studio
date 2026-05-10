@@ -1,0 +1,6 @@
+{
+  "name": "圖片擷取工具",
+  "description": "自動化檔案圖片擷取工具，支援從 docx, xlsx, pdf 檔案中批次提取圖片並存放在同名資料夾中，可識別並記錄掃描型 PDF。",
+  "requestFramePermissions": [],
+  "majorCapabilities": []
+}
