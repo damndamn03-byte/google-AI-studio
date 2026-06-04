@@ -123,6 +123,30 @@ export default function App() {
         throw e;
       });
 
+      // 顯式驗證並請求資料夾寫入與修改權限（此時仍處於使用者點選之 Gesture 動態執行環境下）
+      const verifyWritePermission = async (handle: FileSystemDirectoryHandle) => {
+        const opts = { mode: 'readwrite' };
+        try {
+          if ((await (handle as any).queryPermission(opts)) === 'granted') {
+            return true;
+          }
+          if ((await (handle as any).requestPermission(opts)) === 'granted') {
+            return true;
+          }
+        } catch (e) {
+          console.warn('權限詢問失敗，將嘗試直接建立目錄：', e);
+        }
+        return false;
+      };
+
+      const hasWritePermission = await verifyWritePermission(dirHandle);
+      if (!hasWritePermission) {
+        throw new Error(
+          '未取得資料夾的寫入/修改權限！本工具需要在您選取的資料夾中建立子資料夾來存放擷取的圖片。\n' +
+          '請確保在瀏覽器彈出「允許此網站編輯此資料夾嗎？」時，點擊「允許」或「儲存變更」權限。'
+        );
+      }
+
       setIsProcessing(true);
       setStopRequested(false);
       setResults([]);
@@ -434,6 +458,14 @@ export default function App() {
                           <p className="text-xs text-neutral-400 truncate font-mono">
                             {result.filePath}
                           </p>
+                          {result.message && (
+                            <p className={`text-xs mt-1 font-sans ${
+                              result.status === 'error' ? 'text-red-500 font-medium' : 
+                              result.status === 'skipped_scan' ? 'text-amber-500' : 'text-neutral-500'
+                            }`}>
+                              {result.message}
+                            </p>
+                          )}
                         </div>
                       </div>
                       <div className="flex items-center gap-3 shrink-0">
