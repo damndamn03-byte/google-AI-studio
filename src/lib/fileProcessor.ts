@@ -12,6 +12,64 @@ export interface ProcessingResult {
   message?: string;
 }
 
+// Helper to sanitize filename
+function sanitizeFilename(name: string): string {
+  return name.replace(/[\\/:*?"<>|]/g, '_');
+}
+
+// Helper to check if a file path has an image extension
+function isImageFile(path: string): boolean {
+  const ext = path.split('.').pop()?.toLowerCase();
+  return !!(ext && ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'emf', 'wmf', 'svg', 'tiff', 'tif', 'webp'].includes(ext));
+}
+
+// Helper to normalized OOXML relationship paths
+function normalizeExcelPath(baseDir: string, target: string): string {
+  if (target.startsWith('/')) {
+    return target.substring(1);
+  }
+  const parts = baseDir.split('/').filter(Boolean);
+  const targetParts = target.split('/');
+  for (const p of targetParts) {
+    if (p === '.') {
+      continue;
+    } else if (p === '..') {
+      parts.pop();
+    } else {
+      parts.push(p);
+    }
+  }
+  return parts.join('/');
+}
+
+// Helper to look up element attributes in a namespace insensitive way
+const getAttrVal = (el: Element, attrName: string): string | null => {
+  const exact = el.getAttribute(attrName);
+  if (exact !== null) return exact;
+  const lowercase = el.getAttribute(attrName.toLowerCase());
+  if (lowercase !== null) return lowercase;
+  
+  for (let i = 0; i < el.attributes.length; i++) {
+    const attr = el.attributes[i];
+    if (attr.localName === attrName || attr.localName?.toLowerCase() === attrName.toLowerCase()) {
+      return attr.value;
+    }
+  }
+  return null;
+};
+
+// Helper lookup for any elements matching the localName across DOM
+const getElementsByLocalName = (parent: Document | Element, localName: string): Element[] => {
+  const all = parent.getElementsByTagName('*');
+  const result: Element[] = [];
+  for (let i = 0; i < all.length; i++) {
+    if (all[i].localName === localName) {
+      result.push(all[i]);
+    }
+  }
+  return result;
+};
+
 export async function extractImagesFromOffice(file: File, targetDirHandle: FileSystemDirectoryHandle): Promise<number> {
   const arrayBuffer = await file.arrayBuffer();
   
@@ -28,71 +86,130 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
   const isXlsx = nameLower.endsWith('.xlsx');
   
   const parser = new DOMParser();
-  const orderedMediaPaths: string[] = [];
+  
+  interface ExtractionItem {
+    mediaPath: string;
+    sheetName?: string;
+    pageNumber?: number;
+    row?: number;
+    col?: number;
+  }
+  
+  const finalExtractions: ExtractionItem[] = [];
+  
+  // 計算本 Office 的媒體資料夾基礎路徑
+  let mediaPathPrefix = 'xl/media/';
+  if (isDocx) {
+    mediaPathPrefix = 'word/media/';
+  } else {
+    // 自動檢測媒體資料夾以相容多種變體
+    const firstMediaFolder = Object.keys(zip.files).find(p => p.includes('/media/'));
+    if (firstMediaFolder) {
+      const idx = firstMediaFolder.indexOf('/media/');
+      mediaPathPrefix = firstMediaFolder.substring(0, idx + 7);
+    }
+  }
+  
+  // 彙整 ZIP 中所有媒體檔案，確保 100% 都不缺失
+  const allMediaFilesInZip = Object.keys(zip.files).filter(path => path.startsWith(mediaPathPrefix) && !zip.files[path].dir && isImageFile(path));
   
   if (isXlsx) {
     try {
-      // 1. 取得所有 Worksheet 檔案並按數字進行自然排序 (e.g. sheet1.xml, sheet2.xml)
-      const sheetFiles = Object.keys(zip.files).filter(path => /^xl\/worksheets\/sheet\d+\.xml$/i.test(path));
-      sheetFiles.sort((a, b) => {
-        const matchA = a.match(/\d+/);
-        const matchB = b.match(/\d+/);
-        const numA = matchA ? parseInt(matchA[0], 10) : 0;
-        const numB = matchB ? parseInt(matchB[0], 10) : 0;
-        return numA - numB;
-      });
+      // 1. 解析 xl/workbook.xml 及其 rels，建立工作表檔案路徑與真實工作表名稱的映射
+      const sheetPathToName = new Map<string, string>();
+      try {
+        const workbookXmlText = await zip.file('xl/workbook.xml')?.async('string');
+        const workbookRelsText = await zip.file('xl/_rels/workbook.xml.rels')?.async('string');
+        
+        if (workbookXmlText && workbookRelsText) {
+          const workbookDoc = parser.parseFromString(workbookXmlText, 'application/xml');
+          const relsDoc = parser.parseFromString(workbookRelsText, 'application/xml');
+          
+          const rIdToTarget = new Map<string, string>();
+          const relationships = getElementsByLocalName(relsDoc, 'Relationship');
+          for (const rel of relationships) {
+            const id = getAttrVal(rel, 'Id');
+            const target = getAttrVal(rel, 'Target');
+            if (id && target) {
+              const fullTarget = normalizeExcelPath('xl', target);
+              rIdToTarget.set(id, fullTarget);
+            }
+          }
+          
+          const sheets = getElementsByLocalName(workbookDoc, 'sheet');
+          for (const sheet of sheets) {
+            const name = getAttrVal(sheet, 'name') || '';
+            const rId = getAttrVal(sheet, 'id') || getAttrVal(sheet, 'r:id');
+            if (name && rId) {
+              const targetPath = rIdToTarget.get(rId);
+              if (targetPath) {
+                sheetPathToName.set(targetPath, name);
+              }
+            }
+          }
+        }
+      } catch (e) {
+        console.warn('解析 Excel 工作表名稱失敗:', e);
+      }
       
       // 2. 依照工作表順序，查找關聯的 Drawing 檔案 (sheet rels)
+      const drawingToSheetName = new Map<string, string>();
       const drawingOrder: string[] = [];
-      for (const sheetPath of sheetFiles) {
-        const sheetName = sheetPath.split('/').pop()!;
-        const relsPath = `xl/worksheets/_rels/${sheetName}.rels`;
+      
+      const sheetFiles = Object.keys(zip.files).filter(path => /^xl\/worksheets\/sheet\d+\.xml$/i.test(path));
+      const orderedSheets = Array.from(sheetPathToName.keys()).filter(path => zip.file(path));
+      for (const sf of sheetFiles) {
+        if (!orderedSheets.includes(sf)) {
+          orderedSheets.push(sf);
+        }
+      }
+      
+      for (const sheetPath of orderedSheets) {
+        const sheetXmlName = sheetPath.split('/').pop()!;
+        const relsPath = `xl/worksheets/_rels/${sheetXmlName}.rels`;
+        const resolvedSheetName = sheetPathToName.get(sheetPath) || sheetXmlName.replace('.xml', '');
+        
         if (zip.file(relsPath)) {
           const relsText = await zip.file(relsPath)!.async('string');
           const relsDoc = parser.parseFromString(relsText, 'application/xml');
-          const relationships = relsDoc.getElementsByTagName('Relationship');
-          for (let i = 0; i < relationships.length; i++) {
-            const rel = relationships[i];
-            const type = rel.getAttribute('Type');
-            const target = rel.getAttribute('Target');
+          const relationships = getElementsByLocalName(relsDoc, 'Relationship');
+          for (const rel of relationships) {
+            const type = getAttrVal(rel, 'Type');
+            const target = getAttrVal(rel, 'Target');
             if (type?.endsWith('/drawing') && target) {
-              let resolvedTarget = target;
-              if (target.startsWith('../')) {
-                resolvedTarget = 'xl/' + target.substring(3);
-              } else {
-                resolvedTarget = 'xl/worksheets/' + target;
-              }
+              const resolvedTarget = normalizeExcelPath('xl/worksheets', target);
               if (!drawingOrder.includes(resolvedTarget)) {
                 drawingOrder.push(resolvedTarget);
               }
+              drawingToSheetName.set(resolvedTarget, resolvedSheetName);
             }
           }
         }
       }
       
-      // 3. 備用方案：將其餘 XML drawings 按數值自然排序，追加到最後
+      // 3. 備用方案：追加其餘 Drawings 項目
       const allDrawings = Object.keys(zip.files).filter(path => /^xl\/drawings\/drawing\d+\.xml$/i.test(path));
       allDrawings.sort((a, b) => {
-        const matchA = a.match(/\d+/);
-        const matchB = b.match(/\d+/);
-        const numA = matchA ? parseInt(matchA[0], 10) : 0;
-        const numB = matchB ? parseInt(matchB[0], 10) : 0;
+        const numA = parseInt(a.replace(/\D/g, '') || '0', 10);
+        const numB = parseInt(b.replace(/\D/g, '') || '0', 10);
         return numA - numB;
       });
       for (const dr of allDrawings) {
         if (!drawingOrder.includes(dr)) {
           drawingOrder.push(dr);
+          if (!drawingToSheetName.has(dr)) {
+            drawingToSheetName.set(dr, '其他');
+          }
         }
       }
       
-      interface ExcelImageInfo {
+      const collectedImages: {
         drawingIndex: number;
+        sheetName: string;
         row: number;
         col: number;
         mediaPath: string;
-      }
-      
-      const collectedImages: ExcelImageInfo[] = [];
+      }[] = [];
       
       const findInSubtree = (parent: Element, name: string): Element | null => {
         const elements = parent.getElementsByTagName('*');
@@ -104,7 +221,7 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
         return null;
       };
       
-      // 4. 解析各繪圖 XML 當中的儲存格位置 (Row 與 Col)
+      // 4. 解析各繪圖 XML 中形狀/圖片的儲存格坐標 (Row & Col)
       for (let d = 0; d < drawingOrder.length; d++) {
         const drawingPath = drawingOrder[d];
         const drawingXmlFile = zip.file(drawingPath);
@@ -113,25 +230,23 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
         const drawingText = await drawingXmlFile.async('string');
         const lastSlash = drawingPath.lastIndexOf('/');
         const dir = drawingPath.substring(0, lastSlash);
-        const fileName = drawingPath.substring(lastSlash + 1);
-        const relsPath = `${dir}/_rels/${fileName}.rels`;
+        const fileXmlName = drawingPath.substring(lastSlash + 1);
+        const relsPath = `${dir}/_rels/${fileXmlName}.rels`;
+        const currentSheetName = drawingToSheetName.get(drawingPath) || '其他';
         
         const rIdToMedia = new Map<string, string>();
         if (zip.file(relsPath)) {
           const relsText = await zip.file(relsPath)!.async('string');
           const relsDoc = parser.parseFromString(relsText, 'application/xml');
-          const relationships = relsDoc.getElementsByTagName('Relationship');
-          for (let i = 0; i < relationships.length; i++) {
-            const rel = relationships[i];
-            const id = rel.getAttribute('Id');
-            let target = rel.getAttribute('Target');
+          const relationships = getElementsByLocalName(relsDoc, 'Relationship');
+          for (const rel of relationships) {
+            const id = getAttrVal(rel, 'Id');
+            const target = getAttrVal(rel, 'Target');
             if (id && target) {
-              if (target.startsWith('../')) {
-                target = 'xl/' + target.substring(3); // ../media/image1.png -> xl/media/image1.png
-              } else if (!target.startsWith('xl/')) {
-                target = 'xl/drawings/' + target;
+              const fullTarget = normalizeExcelPath(dir, target);
+              if (isImageFile(fullTarget)) {
+                rIdToMedia.set(id, fullTarget);
               }
-              rIdToMedia.set(id, target);
             }
           }
         }
@@ -153,19 +268,7 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
           const blipNode = findInSubtree(anchor, 'blip');
           let rId = null;
           if (blipNode) {
-            rId = blipNode.getAttribute('r:embed') || blipNode.getAttribute('embed');
-            if (!rId) {
-              // 備份命名空間查詢
-              rId = blipNode.getAttributeNS('http://schemas.openxmlformats.org/officeDocument/2006/relationships', 'embed');
-            }
-            if (!rId) {
-              for (let i = 0; i < blipNode.attributes.length; i++) {
-                if (blipNode.attributes[i].localName === 'embed') {
-                  rId = blipNode.attributes[i].value;
-                  break;
-                }
-              }
-            }
+            rId = getAttrVal(blipNode, 'embed');
           }
           
           if (rId) {
@@ -173,6 +276,7 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
             if (mediaPath && zip.file(mediaPath)) {
               collectedImages.push({
                 drawingIndex: d,
+                sheetName: currentSheetName,
                 row,
                 col,
                 mediaPath
@@ -182,7 +286,7 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
         }
       }
       
-      // 5. 按工作表排序 -> 按橫列Row優先 (一列擷取完再換下一列) -> 再按直欄Col 排序依序呈現
+      // 5. 排序：工作表(繪圖索引)優先 -> 橫列(Row)優先 -> 直欄(Col)
       collectedImages.sort((a, b) => {
         if (a.drawingIndex !== b.drawingIndex) {
           return a.drawingIndex - b.drawingIndex;
@@ -193,12 +297,30 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
         return a.col - b.col;
       });
       
-      // 將排序後的媒體路徑加入 (不進行去重，以支援重複位置的同一個圖片能依序、個別擷取)
       for (const img of collectedImages) {
-        orderedMediaPaths.push(img.mediaPath);
+        finalExtractions.push({
+          mediaPath: img.mediaPath,
+          sheetName: img.sheetName,
+          row: img.row,
+          col: img.col
+        });
+      }
+      
+      // 6. 補上其他未在 Drawing 被參照的媒體檔案 (如頁首、浮水印等)
+      const extractedPaths = new Set(collectedImages.map(img => img.mediaPath));
+      for (const path of allMediaFilesInZip) {
+        if (!extractedPaths.has(path)) {
+          finalExtractions.push({
+            mediaPath: path,
+            sheetName: '其他'
+          });
+        }
       }
     } catch (e) {
-      console.warn('XLSX 圖片儲存格排序解析失敗，將退回傳統處理方式', e);
+      console.warn('XLSX 工作表與儲存格排序解析失敗，退回傳統模式', e);
+      for (const path of allMediaFilesInZip) {
+        finalExtractions.push({ mediaPath: path, sheetName: '工作表' });
+      }
     }
   } else if (isDocx) {
     try {
@@ -208,99 +330,129 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
       if (zip.file(relsPath)) {
         const relsText = await zip.file(relsPath)!.async('string');
         const relsDoc = parser.parseFromString(relsText, 'application/xml');
-        const relationships = relsDoc.getElementsByTagName('Relationship');
-        for (let i = 0; i < relationships.length; i++) {
-          const rel = relationships[i];
-          const id = rel.getAttribute('Id');
-          let target = rel.getAttribute('Target');
+        const relationships = getElementsByLocalName(relsDoc, 'Relationship');
+        for (const rel of relationships) {
+          const id = getAttrVal(rel, 'Id');
+          const target = getAttrVal(rel, 'Target');
           if (id && target) {
+            let fullTarget = target;
             if (!target.startsWith('word/')) {
-              target = 'word/' + target;
+              fullTarget = 'word/' + target;
             }
-            rIdToMedia.set(id, target);
+            if (isImageFile(fullTarget)) {
+              rIdToMedia.set(id, fullTarget);
+            }
           }
         }
       }
       
-      // 2. 載入並解析主文檔 XML (word/document.xml) 內 blip 出現之物理順序
+      // 2. 遞迴走訪主文檔，估計分頁與保留物理流順序
       const docPath = 'word/document.xml';
       if (zip.file(docPath)) {
         const docText = await zip.file(docPath)!.async('string');
         const doc = parser.parseFromString(docText, 'application/xml');
-        const blips = doc.getElementsByTagNameNS('*', 'blip');
         
-        for (let i = 0; i < blips.length; i++) {
-          const blip = blips[i];
-          let rId = blip.getAttribute('r:embed') || blip.getAttribute('embed');
-          if (!rId) {
-            for (let a = 0; a < blip.attributes.length; a++) {
-              if (blip.attributes[a].localName === 'embed') {
-                rId = blip.attributes[a].value;
-                break;
+        let currentPage = 1;
+        
+        const walkNode = (node: Node) => {
+          if (node.nodeType === Node.ELEMENT_NODE) {
+            const el = node as Element;
+            const localName = el.localName;
+            
+            if (localName === 'lastRenderedPageBreak') {
+              currentPage++;
+            } else if (localName === 'br' && getAttrVal(el, 'type') === 'page') {
+              currentPage++;
+            }
+            
+            let rId = getAttrVal(el, 'embed');
+            if (!rId) {
+              rId = getAttrVal(el, 'id');
+            }
+            
+            if (rId && rIdToMedia.has(rId)) {
+              const mediaPath = rIdToMedia.get(rId)!;
+              if (zip.file(mediaPath)) {
+                finalExtractions.push({
+                  mediaPath,
+                  pageNumber: currentPage
+                });
               }
             }
           }
-          if (rId) {
-            const mediaPath = rIdToMedia.get(rId);
-            if (mediaPath && zip.file(mediaPath)) {
-              orderedMediaPaths.push(mediaPath);
-            }
+          
+          let child = node.firstChild;
+          while (child) {
+            walkNode(child);
+            child = child.nextSibling;
           }
-        }
+        };
         
-        // 額外使用正則表達式作為強固安全保障 (僅在 DOM 解析無效時，才當作備用覆蓋層，避免多重探針產生衝突)
-        if (orderedMediaPaths.length === 0) {
-          const matches = [...docText.matchAll(/(?:r:embed|embed)=["']([^"']+)["']/g)];
-          for (const m of matches) {
-            const rId = m[1];
-            const mediaPath = rIdToMedia.get(rId);
-            if (mediaPath && zip.file(mediaPath)) {
-              orderedMediaPaths.push(mediaPath);
-            }
-          }
+        walkNode(doc);
+      }
+      
+      // 3. 補上其他未在主流程中抓到的圖片 (背景、頁碼、備份)
+      const extractedPaths = new Set(finalExtractions.map(ext => ext.mediaPath));
+      for (const path of allMediaFilesInZip) {
+        if (!extractedPaths.has(path)) {
+          finalExtractions.push({
+            mediaPath: path,
+            pageNumber: 1
+          });
         }
       }
     } catch (e) {
-      console.warn('DOCX 圖片文檔流順序解析失敗，將退回傳統處理方式', e);
+      console.warn('DOCX 走訪解析失敗，退回傳統分頁模式', e);
+      for (const path of allMediaFilesInZip) {
+        finalExtractions.push({ mediaPath: path, pageNumber: 1 });
+      }
     }
-  }
-  
-  // 6. 計算本 Office 的媒體資料夾基礎路徑
-  let mediaPathPrefix = 'xl/media/';
-  if (isDocx) {
-    mediaPathPrefix = 'word/media/';
   } else {
-    // 自動檢測媒體資料夾以相容多種變體
-    const firstMediaFolder = Object.keys(zip.files).find(p => p.includes('/media/'));
-    if (firstMediaFolder) {
-      const idx = firstMediaFolder.indexOf('/media/');
-      mediaPathPrefix = firstMediaFolder.substring(0, idx + 7);
+    // 其他 Office 文件格式直接順序解析
+    for (const path of allMediaFilesInZip) {
+      finalExtractions.push({ mediaPath: path });
     }
   }
   
-  // 7. 彙整 ZIP 中所有媒體檔案，確保 100% 都不缺失 (可能存在未被 document/sheet XML 列出的圖片，例如：頁首頁尾、浮水印、背景)
-  const allMediaFilesInZip = Object.keys(zip.files).filter(path => path.startsWith(mediaPathPrefix) && !zip.files[path].dir);
-  
-  const finalPathsToExtract: string[] = [...orderedMediaPaths];
-  for (const path of allMediaFilesInZip) {
-    if (!finalPathsToExtract.includes(path)) {
-      finalPathsToExtract.push(path);
-    }
-  }
+  // 建立各 Sheet / 各 Page 子獨立增序列
+  const excelSheetCounters = new Map<string, number>();
+  const docxPageCounters = new Map<number, number>();
   
   let count = 0;
-  for (let i = 0; i < finalPathsToExtract.length; i++) {
-    const path = finalPathsToExtract[i];
+  for (let i = 0; i < finalExtractions.length; i++) {
+    const item = finalExtractions[i];
     try {
-      const zipFile = zip.files[path];
+      const zipFile = zip.files[item.mediaPath];
       if (!zipFile || zipFile.dir) continue;
       
       const blob = await zipFile.async('blob');
-      const originalName = path.split('/').pop() || `image_${count + 1}`;
       
-      // 圖片命名規則：前置三位數補零的序列（例如：001_image1.png），保證視窗與電腦檔案總管能依序排列
-      const prefix = String(count + 1).padStart(3, '0');
-      const fileName = `${prefix}_${originalName}`;
+      let fileName = '';
+      const originalName = item.mediaPath.split('/').pop() || `image_${count + 1}`;
+      const ext = originalName.split('.').pop()?.toLowerCase() || 'png';
+      
+      if (isXlsx) {
+        // Excel 命名格式：[工作表名稱]_image[3位補零工作表記數].[副檔名]
+        const sheetName = item.sheetName || '工作表';
+        const nextIdx = (excelSheetCounters.get(sheetName) || 0) + 1;
+        excelSheetCounters.set(sheetName, nextIdx);
+        
+        const prefix = String(nextIdx).padStart(3, '0');
+        const sanitizedSheet = sanitizeFilename(sheetName);
+        fileName = `${sanitizedSheet}_image${prefix}.${ext}`;
+      } else if (isDocx) {
+        // Word 命名格式：page[頁碼]_image[3位補零頁計數].[副檔名]
+        const pageNum = item.pageNumber || 1;
+        const nextIdx = (docxPageCounters.get(pageNum) || 0) + 1;
+        docxPageCounters.set(pageNum, nextIdx);
+        
+        const prefix = String(nextIdx).padStart(3, '0');
+        fileName = `page${pageNum}_image${prefix}.${ext}`;
+      } else {
+        // 其他文件
+        const prefix = String(count + 1).padStart(3, '0');
+        fileName = `image${prefix}.${ext}`;
+      }
       
       const fileHandle = await targetDirHandle.getFileHandle(fileName, { create: true });
       const writable = await fileHandle.createWritable();
@@ -308,7 +460,7 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
       await writable.close();
       count++;
     } catch (e) {
-      console.warn(`跳過特定圖片擷取，路徑: ${path}`, e);
+      console.warn(`跳過特定圖片擷取，路徑: ${item.mediaPath}`, e);
     }
   }
   
@@ -327,6 +479,7 @@ export async function extractImagesFromPdf(file: File, targetDirHandle: FileSyst
   let totalImages = 0;
   let totalTextChars = 0;
   const pagesToCheck = Math.min(pdf.numPages, 3);
+  const pdfPageCounters = new Map<number, number>();
   
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
@@ -360,7 +513,10 @@ export async function extractImagesFromPdf(file: File, targetDirHandle: FileSyst
           if (img && (img.data || img.bitmap)) {
             const blob = await imageToBlob(img);
             if (blob) {
-              const fileName = `page${i}_image_${totalImages + 1}.png`;
+              const nextIdx = (pdfPageCounters.get(i) || 0) + 1;
+              pdfPageCounters.set(i, nextIdx);
+              const prefix = String(nextIdx).padStart(3, '0');
+              const fileName = `page${i}_image${prefix}.png`;
               const fileHandle = await targetDirHandle.getFileHandle(fileName, { create: true });
               const writable = await fileHandle.createWritable();
               await writable.write(blob);
