@@ -23,6 +23,36 @@ function isImageFile(path: string): boolean {
   return !!(ext && ['png', 'jpg', 'jpeg', 'gif', 'bmp', 'emf', 'wmf', 'svg', 'tiff', 'tif', 'webp'].includes(ext));
 }
 
+// Helper to validate if a blob is a valid displayable image in browser
+async function isValidBrowserImage(blob: Blob): Promise<boolean> {
+  // If the blob size is extremely tiny (e.g., less than 100 bytes), it is likely a bad or empty placeholder
+  if (blob.size < 100) return false;
+  
+  return new Promise((resolve) => {
+    const url = URL.createObjectURL(blob);
+    const img = new Image();
+    
+    let timer = setTimeout(() => {
+      img.onload = null;
+      img.onerror = null;
+      URL.revokeObjectURL(url);
+      resolve(false); // timeout, invalid/unsupported image
+    }, 2000); // 2 seconds timeout for safety
+    
+    img.onload = () => {
+      clearTimeout(timer);
+      URL.revokeObjectURL(url);
+      resolve(img.width > 0 && img.height > 0);
+    };
+    img.onerror = () => {
+      clearTimeout(timer);
+      URL.revokeObjectURL(url);
+      resolve(false);
+    };
+    img.src = url;
+  });
+}
+
 // Helper to normalized OOXML relationship paths
 function normalizeExcelPath(baseDir: string, target: string): string {
   if (target.startsWith('/')) {
@@ -427,6 +457,12 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
       
       const blob = await zipFile.async('blob');
       
+      // Filter out invalid, zero-size, or non-displayable formats like EMF/WMF which browser cannot render
+      const isValid = await isValidBrowserImage(blob);
+      if (!isValid) {
+        continue;
+      }
+      
       let fileName = '';
       const originalName = item.mediaPath.split('/').pop() || `image_${count + 1}`;
       const ext = originalName.split('.').pop()?.toLowerCase() || 'png';
@@ -478,13 +514,17 @@ export async function extractImagesFromPdf(file: File, targetDirHandle: FileSyst
   
   let totalImages = 0;
   let totalTextChars = 0;
-  const pagesToCheck = Math.min(pdf.numPages, 3);
+  
+  // 計算 1/3 的總頁數作為檢測斷點 (最少要檢測 1 頁)
+  const checkPointPage = Math.max(1, Math.ceil(pdf.numPages / 3));
+  let isScanned = false;
   const pdfPageCounters = new Map<number, number>();
   
   for (let i = 1; i <= pdf.numPages; i++) {
     const page = await pdf.getPage(i);
     
-    if (i <= pagesToCheck) {
+    // 執行檔案三分之一內容，收集文字資訊
+    if (i <= checkPointPage) {
       const textContent = await page.getTextContent();
       const text = textContent.items.map((item: any) => item.str).join('');
       totalTextChars += text.trim().length;
@@ -529,9 +569,18 @@ export async function extractImagesFromPdf(file: File, targetDirHandle: FileSyst
         }
       }
     }
-  }
 
-  const isScanned = (totalTextChars / pagesToCheck) < 30 && pdf.numPages > 0;
+    // 達到 1/3 頁數時進行判定：若這 1/3 內容沒偵測到文字，則判定為掃描檔並中斷執行
+    if (i === checkPointPage) {
+      if (totalTextChars < 30 && pdf.numPages > 0) {
+        isScanned = true;
+        console.log(`PDF 偵測結果: 在前三分之一內容 (${checkPointPage}/${pdf.numPages} 頁) 中僅偵測到 ${totalTextChars} 個字元，判定為掃描型 PDF，中止擷取。`);
+        break; // 中止後續頁面處理
+      } else {
+        console.log(`PDF 偵測結果: 在前三分之一內容 (${checkPointPage}/${pdf.numPages} 頁) 中偵測到 ${totalTextChars} 個字元，保留文字型 PDF，持續執行。`);
+      }
+    }
+  }
   
   return { count: totalImages, isScanned };
 }

@@ -41,6 +41,7 @@ import { extractImagesFromOffice, extractImagesFromPdf, ProcessingResult } from 
 export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [stopRequested, setStopRequested] = useState(false);
+  const stopRequestedRef = React.useRef(false);
   const [results, setResults] = useState<ProcessingResult[]>([]);
   const [progress, setProgress] = useState(0);
   const [statusText, setStatusText] = useState('');
@@ -102,6 +103,7 @@ export default function App() {
   const handleStop = () => {
     if (isProcessing) {
       setStopRequested(true);
+      stopRequestedRef.current = true;
       setStatusText('正等待當前檔案處理完畢後停止...');
     }
   };
@@ -149,6 +151,7 @@ export default function App() {
 
       setIsProcessing(true);
       setStopRequested(false);
+      stopRequestedRef.current = false;
       setResults([]);
       setProgress(0);
       setError(null);
@@ -183,7 +186,7 @@ export default function App() {
 
       for (let i = 0; i < total; i++) {
         // Check if user requested to stop
-        if (stopRequested) {
+        if (stopRequestedRef.current) {
           setStatusText(`已停止作業。共處理了 ${newResults.length} 個檔案。`);
           break;
         }
@@ -266,7 +269,7 @@ export default function App() {
         success: newResults.filter(r => r.status === 'success' && r.imagesExtracted > 0).length,
       };
 
-      setStatusText(stopRequested ? '作業已由使用者中斷。' : '處理完成！');
+      setStatusText(stopRequestedRef.current ? '作業已由使用者中斷。' : '處理完成！');
       setIsProcessing(false);
       setStopRequested(false);
       notifyComplete(currentStats);
