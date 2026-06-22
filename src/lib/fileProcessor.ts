@@ -17,6 +17,13 @@ function sanitizeFilename(name: string): string {
   return name.replace(/[\\/:*?"<>|]/g, '_');
 }
 
+// Helper to get file base name without extension, and sanitized
+function getFileBaseName(filename: string): string {
+  const lastDot = filename.lastIndexOf('.');
+  const base = lastDot === -1 ? filename : filename.substring(0, lastDot);
+  return sanitizeFilename(base);
+}
+
 // Helper to check if a file path has an image extension
 function isImageFile(path: string): boolean {
   const ext = path.split('.').pop()?.toLowerCase();
@@ -466,6 +473,7 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
       let fileName = '';
       const originalName = item.mediaPath.split('/').pop() || `image_${count + 1}`;
       const ext = originalName.split('.').pop()?.toLowerCase() || 'png';
+      const baseName = getFileBaseName(file.name);
       
       if (isXlsx) {
         // Excel 命名格式：[工作表名稱]_image[3位補零工作表記數].[副檔名]
@@ -475,7 +483,7 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
         
         const prefix = String(nextIdx).padStart(3, '0');
         const sanitizedSheet = sanitizeFilename(sheetName);
-        fileName = `${sanitizedSheet}_image${prefix}.${ext}`;
+        fileName = `${baseName}_${sanitizedSheet}_image${prefix}.${ext}`;
       } else if (isDocx) {
         // Word 命名格式：page[頁碼]_image[3位補零頁計數].[副檔名]
         const pageNum = item.pageNumber || 1;
@@ -483,11 +491,11 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
         docxPageCounters.set(pageNum, nextIdx);
         
         const prefix = String(nextIdx).padStart(3, '0');
-        fileName = `page${pageNum}_image${prefix}.${ext}`;
+        fileName = `${baseName}_page${pageNum}_image${prefix}.${ext}`;
       } else {
         // 其他文件
         const prefix = String(count + 1).padStart(3, '0');
-        fileName = `image${prefix}.${ext}`;
+        fileName = `${baseName}_image${prefix}.${ext}`;
       }
       
       const fileHandle = await targetDirHandle.getFileHandle(fileName, { create: true });
@@ -505,6 +513,7 @@ export async function extractImagesFromOffice(file: File, targetDirHandle: FileS
 
 export async function extractImagesFromPdf(file: File, targetDirHandle: FileSystemDirectoryHandle): Promise<{ count: number; isScanned: boolean }> {
   const arrayBuffer = await file.arrayBuffer();
+  const baseName = getFileBaseName(file.name);
   
   const loadingTask = pdfjsLib.getDocument({ 
     data: arrayBuffer,
@@ -556,7 +565,7 @@ export async function extractImagesFromPdf(file: File, targetDirHandle: FileSyst
               const nextIdx = (pdfPageCounters.get(i) || 0) + 1;
               pdfPageCounters.set(i, nextIdx);
               const prefix = String(nextIdx).padStart(3, '0');
-              const fileName = `page${i}_image${prefix}.png`;
+              const fileName = `${baseName}_page${i}_image${prefix}.png`;
               const fileHandle = await targetDirHandle.getFileHandle(fileName, { create: true });
               const writable = await fileHandle.createWritable();
               await writable.write(blob);

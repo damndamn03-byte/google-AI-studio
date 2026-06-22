@@ -54,14 +54,43 @@ export default function App() {
   // Initialize notification state
   useEffect(() => {
     if ('Notification' in window) {
-      setNotificationsEnabled(Notification.permission === 'granted');
+      const saved = localStorage.getItem('notifications_enabled');
+      if (saved !== null) {
+        setNotificationsEnabled(saved === 'true' && Notification.permission === 'granted');
+      } else {
+        setNotificationsEnabled(Notification.permission === 'granted');
+      }
     }
   }, []);
 
   const requestNotificationPermission = async () => {
-    if ('Notification' in window) {
+    if (!('Notification' in window)) {
+      alert('您的瀏覽器不支援桌面通知功能。');
+      return;
+    }
+
+    if (Notification.permission === 'denied') {
+      alert('桌面通知權限已被您或瀏覽器封鎖，按鈕無法直接開啟。\n請在瀏覽器網址列左側的「網站資訊」（鎖頭或控制按鈕）中，將「通知」權限設為「允許」後再嘗試。');
+      return;
+    }
+
+    if (Notification.permission === 'default') {
       const permission = await Notification.requestPermission();
-      setNotificationsEnabled(permission === 'granted');
+      if (permission === 'granted') {
+        setNotificationsEnabled(true);
+        localStorage.setItem('notifications_enabled', 'true');
+      } else {
+        setNotificationsEnabled(false);
+        localStorage.setItem('notifications_enabled', 'false');
+      }
+      return;
+    }
+
+    if (Notification.permission === 'granted') {
+      // Toggle state directly
+      const newValue = !notificationsEnabled;
+      setNotificationsEnabled(newValue);
+      localStorage.setItem('notifications_enabled', String(newValue));
     }
   };
 
