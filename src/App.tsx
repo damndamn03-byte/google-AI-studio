@@ -197,8 +197,10 @@ export default function App() {
               filesToProcess.push({ handle: entry as FileSystemFileHandle, relativePath: entryPath, name: entry.name });
             }
           } else if (entry.kind === 'directory') {
-            // 跳過我們自己建立的擷取目錄，避免二次掃描
-            if (!entry.name.endsWith('_extracted_images')) {
+            // 跳過我們自己建立的擷取目錄（包括以支援副檔名結尾的資料夾或 _extracted_images 後綴），避免二次掃描
+            const dirExt = entry.name.toLowerCase().split('.').pop();
+            const isOutputFolder = ['docx', 'xlsx', 'pdf', 'doc', 'xls'].includes(dirExt || '');
+            if (!isOutputFolder && !entry.name.endsWith('_extracted_images')) {
               await scanDir(entry as FileSystemDirectoryHandle, entryPath);
             }
           }
@@ -266,18 +268,32 @@ export default function App() {
           let status: ProcessingResult['status'] = 'success';
           let message = '';
 
-          // Create target directory named after the file
-          const targetDirName = `${file.name}_extracted_images`;
+          // Create target directory named after the file (without _extracted_images suffix)
+          // 優先嘗試使用與擷取檔案完全相同的名稱。
+          // 如果同層中已有同名檔案而導致 TypeMismatchError 衝突，則自動降級使用不含副檔名的主檔名建立資料夾。
+          const lastDotIdx = file.name.lastIndexOf('.');
+          const baseName = lastDotIdx !== -1 ? file.name.substring(0, lastDotIdx) : file.name;
           
-          // 徹底移除先前建立的同名圖片資料夾，確保完全清空先前留下的舊檔案。
-          // 這能完全避開對已存在檔案呼叫 createWritable() 時，由 Chromium 拋出的 "state cached in an interface object" (InvalidStateError) 快取衝突。
+          let targetDirName = file.name;
+          let targetDirHandle: FileSystemDirectoryHandle;
+          
           try {
-            await currentParentDir.removeEntry(targetDirName, { recursive: true });
-          } catch (e) {
-            // 若資料夾原本就不存在，此錯誤可被安全忽略
+            try {
+              await currentParentDir.removeEntry(targetDirName, { recursive: true });
+            } catch (e) {
+              // 若資料夾原本就不存在，此錯誤可被安全忽略
+            }
+            targetDirHandle = await currentParentDir.getDirectoryHandle(targetDirName, { create: true });
+          } catch (err) {
+            // 若因為與同層檔案名稱衝突而失敗，降級為不含副檔名的主檔名
+            targetDirName = baseName;
+            try {
+              await currentParentDir.removeEntry(targetDirName, { recursive: true });
+            } catch (e) {
+              // 若資料夾原本就不存在，此錯誤可被安全忽略
+            }
+            targetDirHandle = await currentParentDir.getDirectoryHandle(targetDirName, { create: true });
           }
-
-          const targetDirHandle = await currentParentDir.getDirectoryHandle(targetDirName, { create: true });
 
           if (ext === 'docx' || ext === 'xlsx') {
             count = await extractImagesFromOffice(file, targetDirHandle);
