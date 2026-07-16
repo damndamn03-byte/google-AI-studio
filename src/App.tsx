@@ -36,7 +36,7 @@ import {
   DialogTitle,
   DialogFooter,
 } from "@/components/ui/dialog";
-import { extractImagesFromOffice, extractImagesFromPdf, ProcessingResult } from '@/src/lib/fileProcessor';
+import { extractImagesFromOffice, extractImagesFromPdf, extractImagesFromLegacyOffice, ProcessingResult } from '@/src/lib/fileProcessor';
 
 export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
@@ -185,7 +185,8 @@ export default function App() {
       setProgress(0);
       setError(null);
 
-      const filesToProcess: { handle: FileSystemFileHandle, path: string }[] = [];
+      const filesToProcess: { handle: FileSystemFileHandle; relativePath: string; name: string }[] = [];
+      const newResults: ProcessingResult[] = [];
       
       const scanDir = async (handle: FileSystemDirectoryHandle, currentPath: string = '') => {
         for await (const entry of (handle as any).values()) {
@@ -193,15 +194,18 @@ export default function App() {
           if (entry.kind === 'file') {
             const ext = entry.name.toLowerCase().split('.').pop();
             if (['docx', 'xlsx', 'pdf', 'doc', 'xls'].includes(ext || '')) {
-              filesToProcess.push({ handle: entry as FileSystemFileHandle, path: entryPath });
+              filesToProcess.push({ handle: entry as FileSystemFileHandle, relativePath: entryPath, name: entry.name });
             }
           } else if (entry.kind === 'directory') {
-            await scanDir(entry as FileSystemDirectoryHandle, entryPath);
+            // 跳過我們自己建立的擷取目錄，避免二次掃描
+            if (!entry.name.endsWith('_extracted_images')) {
+              await scanDir(entry as FileSystemDirectoryHandle, entryPath);
+            }
           }
         }
       };
 
-      setStatusText('正在掃描資料夾...');
+      setStatusText('正在掃描與讀取資料夾中所有檔案...');
       await scanDir(dirHandle);
 
       if (filesToProcess.length === 0) {
@@ -210,8 +214,30 @@ export default function App() {
         return;
       }
 
-      const total = filesToProcess.length;
-      const newResults: ProcessingResult[] = [];
+      setStatusText('正在將所有檔案載入至記憶體以避開快取衝突...');
+      const loadedFiles: { file: File; relativePath: string; name: string }[] = [];
+      
+      for (let i = 0; i < filesToProcess.length; i++) {
+        const item = filesToProcess[i];
+        try {
+          const diskFile = await item.handle.getFile();
+          const fileData = await diskFile.arrayBuffer();
+          const file = new File([fileData], diskFile.name, { type: diskFile.type });
+          loadedFiles.push({ file, relativePath: item.relativePath, name: item.name });
+        } catch (e) {
+          console.error(`讀取檔案失敗: ${item.relativePath}`, e);
+          newResults.push({
+            fileName: item.name,
+            filePath: item.relativePath,
+            status: 'error',
+            imagesExtracted: 0,
+            message: e instanceof Error ? e.message : '讀取檔案失敗'
+          });
+        }
+      }
+
+      const total = loadedFiles.length;
+      setResults([...newResults]);
 
       for (let i = 0; i < total; i++) {
         // Check if user requested to stop
@@ -220,52 +246,53 @@ export default function App() {
           break;
         }
 
-        const { handle, path: relativePath } = filesToProcess[i];
-        const file = await handle.getFile();
-        const ext = file.name.toLowerCase().split('.').pop();
+        const { file, relativePath, name } = loadedFiles[i];
+        const ext = name.toLowerCase().split('.').pop();
         
         setStatusText(`正在處理 (${i + 1}/${total}): ${file.name}`);
         setProgress(Math.round(((i + 1) / total) * 100));
 
-        // Get the parent directory handle
-        let currentDir = dirHandle;
-        const pathParts = relativePath.split('/');
-        pathParts.pop(); // Remove filename
-        
-        for (const part of pathParts) {
-          try {
-            currentDir = await currentDir.getDirectoryHandle(part);
-          } catch(e) {
-            console.error(`Failed to get directory handle for ${part}`, e);
-          }
-        }
-
         try {
+          // 每次需要時，當場從根目錄重新走訪，動態取得最新的父目錄控制代碼。
+          // 這樣可以徹底避免在前面的檔案建立新目錄後，導致快取的 DirectoryHandle 拋出 "state cached in an interface object" 錯誤。
+          let currentParentDir = dirHandle;
+          const pathParts = relativePath.split('/');
+          pathParts.pop(); // 移除檔名
+          for (const part of pathParts) {
+            currentParentDir = await currentParentDir.getDirectoryHandle(part);
+          }
+
           let count = 0;
           let status: ProcessingResult['status'] = 'success';
           let message = '';
 
-          if (['doc', 'xls'].includes(ext || '')) {
-            status = 'legacy_skipped';
-            message = '舊式二進位格式 (.doc, .xls) 目前不支援自動擷取，請轉檔為 .docx 或 .xlsx 再試。';
-          } else {
-            // Create target directory named after the file
-            const targetDirName = `${file.name}_extracted_images`;
-            const targetDirHandle = await currentDir.getDirectoryHandle(targetDirName, { create: true });
+          // Create target directory named after the file
+          const targetDirName = `${file.name}_extracted_images`;
+          
+          // 徹底移除先前建立的同名圖片資料夾，確保完全清空先前留下的舊檔案。
+          // 這能完全避開對已存在檔案呼叫 createWritable() 時，由 Chromium 拋出的 "state cached in an interface object" (InvalidStateError) 快取衝突。
+          try {
+            await currentParentDir.removeEntry(targetDirName, { recursive: true });
+          } catch (e) {
+            // 若資料夾原本就不存在，此錯誤可被安全忽略
+          }
 
-            if (ext === 'docx' || ext === 'xlsx') {
-              count = await extractImagesFromOffice(file, targetDirHandle);
-            } else if (ext === 'pdf') {
-              const { count: pdfCount, isScanned } = await extractImagesFromPdf(file, targetDirHandle);
-              count = pdfCount;
-              if (isScanned) {
-                status = 'skipped_scan';
-                message = 'PDF 為掃描型式（無文字資訊），已跳過。';
-                // Remove the empty created directory
-                try {
-                   await currentDir.removeEntry(targetDirName, { recursive: true });
-                } catch(e) {}
-              }
+          const targetDirHandle = await currentParentDir.getDirectoryHandle(targetDirName, { create: true });
+
+          if (ext === 'docx' || ext === 'xlsx') {
+            count = await extractImagesFromOffice(file, targetDirHandle);
+          } else if (ext === 'doc' || ext === 'xls') {
+            count = await extractImagesFromLegacyOffice(file, targetDirHandle);
+          } else if (ext === 'pdf') {
+            const { count: pdfCount, isScanned } = await extractImagesFromPdf(file, targetDirHandle);
+            count = pdfCount;
+            if (isScanned) {
+              status = 'skipped_scan';
+              message = 'PDF 為掃描型式（無文字資訊），已跳過。';
+              // Remove the empty created directory
+              try {
+                 await currentParentDir.removeEntry(targetDirName, { recursive: true });
+              } catch(e) {}
             }
           }
 
@@ -279,8 +306,9 @@ export default function App() {
           newResults.push(result);
           setResults([...newResults]);
         } catch (err) {
+          console.error(`處理檔案失敗: ${relativePath}`, err);
           newResults.push({
-            fileName: file.name,
+            fileName: name,
             filePath: relativePath,
             status: 'error',
             imagesExtracted: 0,
@@ -528,7 +556,7 @@ export default function App() {
 
         {/* Info */}
         <footer className="text-center text-xs text-neutral-400 py-8 border-t border-neutral-100">
-          <p>支援格式: .docx, .xlsx, .pdf, .doc (標記), .xls (標記)</p>
+          <p>支援格式: .docx, .xlsx, .pdf, .doc, .xls</p>
           <p className="mt-1 opacity-70">
             注意: 基於隱私與安全，本工具完全在您的瀏覽器端運行，檔案不會傳送至雲端。
           </p>
