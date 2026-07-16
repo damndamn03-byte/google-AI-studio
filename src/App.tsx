@@ -189,20 +189,43 @@ export default function App() {
       const newResults: ProcessingResult[] = [];
       
       const scanDir = async (handle: FileSystemDirectoryHandle, currentPath: string = '') => {
+        const filesInDir: string[] = [];
+        const subDirs: { name: string; handle: FileSystemDirectoryHandle; entryPath: string }[] = [];
+
         for await (const entry of (handle as any).values()) {
           const entryPath = currentPath ? `${currentPath}/${entry.name}` : entry.name;
           if (entry.kind === 'file') {
+            filesInDir.push(entry.name);
             const ext = entry.name.toLowerCase().split('.').pop();
             if (['docx', 'xlsx', 'pdf', 'doc', 'xls'].includes(ext || '')) {
               filesToProcess.push({ handle: entry as FileSystemFileHandle, relativePath: entryPath, name: entry.name });
             }
           } else if (entry.kind === 'directory') {
-            // 跳過我們自己建立的擷取目錄（包括以支援副檔名結尾的資料夾或 _extracted_images 後綴），避免二次掃描
-            const dirExt = entry.name.toLowerCase().split('.').pop();
-            const isOutputFolder = ['docx', 'xlsx', 'pdf', 'doc', 'xls'].includes(dirExt || '');
-            if (!isOutputFolder && !entry.name.endsWith('_extracted_images')) {
-              await scanDir(entry as FileSystemDirectoryHandle, entryPath);
-            }
+            subDirs.push({ name: entry.name, handle: entry as FileSystemDirectoryHandle, entryPath });
+          }
+        }
+
+        // 建立要忽略的資料夾名稱 Set，包含：
+        // 1. 去除副檔名的主檔名 (baseName)
+        // 2. 去除副檔名的主檔名 + 副檔名 (baseName + ext)
+        // 3. 原有的 _extracted_images 後綴資料夾
+        const ignoreDirs = new Set<string>();
+        for (const fileName of filesInDir) {
+          const lastDotIdx = fileName.lastIndexOf('.');
+          const baseName = lastDotIdx !== -1 ? fileName.substring(0, lastDotIdx) : fileName;
+          const ext = lastDotIdx !== -1 ? fileName.substring(lastDotIdx + 1).toLowerCase() : '';
+
+          ignoreDirs.add(`${fileName}_extracted_images`);
+          if (ext) {
+            ignoreDirs.add(baseName);
+            ignoreDirs.add(`${baseName}${ext}`);
+          }
+        }
+
+        for (const sub of subDirs) {
+          // 跳過我們自己建立的擷取目錄，避免二次掃描
+          if (!ignoreDirs.has(sub.name) && !sub.name.endsWith('_extracted_images')) {
+            await scanDir(sub.handle, sub.entryPath);
           }
         }
       };
@@ -268,32 +291,45 @@ export default function App() {
           let status: ProcessingResult['status'] = 'success';
           let message = '';
 
-          // Create target directory named after the file (without _extracted_images suffix)
-          // 優先嘗試使用與擷取檔案完全相同的名稱。
-          // 如果同層中已有同名檔案而導致 TypeMismatchError 衝突，則自動降級使用不含副檔名的主檔名建立資料夾。
+          // 判斷輸出資料夾名稱：
+          // 預設去除副檔名 (baseName)
+          // 若同目錄中含有相同主檔名但不同副檔名的檔案（兩個不同種類資料），則加上副檔名（副檔名前不加 "."，例如 baseName + ext）
           const lastDotIdx = file.name.lastIndexOf('.');
           const baseName = lastDotIdx !== -1 ? file.name.substring(0, lastDotIdx) : file.name;
-          
-          let targetDirName = file.name;
+
+          const parentParts = relativePath.split('/');
+          parentParts.pop(); // 移除檔名
+          const parentPath = parentParts.join('/');
+
+          const hasDifferentTypes = loadedFiles.some(other => {
+            if (other === loadedFiles[i]) return false;
+
+            // 檢查是否在同一個父目錄下
+            const otherParentParts = other.relativePath.split('/');
+            otherParentParts.pop();
+            const otherParentPath = otherParentParts.join('/');
+            if (otherParentPath !== parentPath) return false;
+
+            // 檢查是否具有相同的主檔名（不分大小寫）
+            const otherLastDotIdx = other.name.lastIndexOf('.');
+            const otherBaseName = otherLastDotIdx !== -1 ? other.name.substring(0, otherLastDotIdx) : other.name;
+            if (otherBaseName.toLowerCase() !== baseName.toLowerCase()) return false;
+
+            // 檢查副檔名是否不同
+            const otherExt = otherLastDotIdx !== -1 ? other.name.substring(otherLastDotIdx + 1).toLowerCase() : '';
+            return otherExt !== ext;
+          });
+
+          const targetDirName = hasDifferentTypes ? `${baseName}${ext}` : baseName;
           let targetDirHandle: FileSystemDirectoryHandle;
-          
+
           try {
-            try {
-              await currentParentDir.removeEntry(targetDirName, { recursive: true });
-            } catch (e) {
-              // 若資料夾原本就不存在，此錯誤可被安全忽略
-            }
-            targetDirHandle = await currentParentDir.getDirectoryHandle(targetDirName, { create: true });
-          } catch (err) {
-            // 若因為與同層檔案名稱衝突而失敗，降級為不含副檔名的主檔名
-            targetDirName = baseName;
-            try {
-              await currentParentDir.removeEntry(targetDirName, { recursive: true });
-            } catch (e) {
-              // 若資料夾原本就不存在，此錯誤可被安全忽略
-            }
-            targetDirHandle = await currentParentDir.getDirectoryHandle(targetDirName, { create: true });
+            await currentParentDir.removeEntry(targetDirName, { recursive: true });
+          } catch (e) {
+            // 若資料夾原本就不存在，此錯誤可被安全忽略
           }
+
+          targetDirHandle = await currentParentDir.getDirectoryHandle(targetDirName, { create: true });
 
           if (ext === 'docx' || ext === 'xlsx') {
             count = await extractImagesFromOffice(file, targetDirHandle);
